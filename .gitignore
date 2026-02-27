@@ -1,0 +1,31 @@
+# IDE
+.idea/
+*.iml
+workspace.xml
+inspectionProfiles/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.dll
+
+# Virtual Environment
+venv/
+env/
+.env
+conda-env/
+Moqing/
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.ml
+
+# OS
+.DS_Store
+Thumbs.db

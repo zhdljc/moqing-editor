@@ -11,6 +11,14 @@ from collections import deque
 import pygame.locals as pl
 from tkinter import filedialog, Tk
 import tkinter as tk
+import subprocess
+import threading
+import queue
+import signal
+import platform
+from PIL import Image, ImageDraw, ImageFont
+
+# 安装依赖：pip install pygame pillow
 
 # Initialize Pygame
 pygame.init()
@@ -46,9 +54,43 @@ ACCENT_ORANGE = (206, 145, 90)
 ACCENT_PURPLE = (197, 134, 192)
 ACCENT_YELLOW = (220, 220, 170)
 ACCENT_CYAN = (78, 201, 176)
+ACCENT_RED = (255, 80, 80)
 SELECTION_COLOR = (55, 85, 115, 80)
 COMMENT_COLOR = (87, 96, 110)
+TERMINAL_BG = (30, 30, 30)
+TERMINAL_TEXT = (220, 220, 220)
 
+# ==================== 字体加载（支持中文）====================
+def get_font(size, bold=False, monospace=False):
+    """尝试加载支持中文的字体，失败则回退到默认字体"""
+    # 常见中文字体名称（按优先级）
+    font_names = [
+        "Microsoft YaHei", "SimHei", "Noto Sans CJK SC",
+        "STHeiti", "WenQuanYi Micro Hei", "Droid Sans Fallback"
+    ]
+    if monospace:
+        # 等宽字体（终端用）
+        font_names = [
+            "Consolas", "Courier New", "DejaVu Sans Mono",
+            "Noto Mono", "WenQuanYi Zen Hei Mono"
+        ] + font_names
+
+    for name in font_names:
+        try:
+            font = pygame.font.SysFont(name, size, bold=bold)
+            # 测试是否能渲染中文
+            test_surf = font.render("测试", True, (255,255,255))
+            if test_surf.get_width() > 0:
+                return font
+        except:
+            continue
+    # 回退到默认字体（可能不支持中文但保证运行）
+    return pygame.font.Font(None, size)
+
+# 预定义字体
+FONT_NORMAL = get_font(24)
+FONT_SMALL = get_font(18)
+FONT_MONO = get_font(20, monospace=True)  # 终端用等宽字体
 
 # Syntax colors by language
 class SyntaxColors:
@@ -81,6 +123,15 @@ class SyntaxColors:
     JAVA_COMMENT = (128, 138, 158)  # Gray
     JAVA_ANNOTATION = (108, 188, 230)  # Cyan
 
+    # C/C++
+    C_KEYWORD = (204, 120, 255)  # Purple
+    C_STRING = (174, 219, 127)  # Green
+    C_COMMENT = (128, 138, 158)  # Gray
+    C_PREPROCESSOR = (206, 145, 90)  # Orange
+    C_NUMBER = (181, 142, 240)  # Purple
+    C_TYPE = (86, 156, 214)  # Blue
+    C_OPERATOR = (255, 153, 102)  # Orange
+
 
 class Language(Enum):
     PYTHON = "Python"
@@ -88,6 +139,8 @@ class Language(Enum):
     HTML = "HTML"
     CSS = "CSS"
     JAVA = "Java"
+    C = "C"
+    CPP = "C++"
     UNKNOWN = "Unknown"
 
 
@@ -133,6 +186,22 @@ class SyntaxHighlighter:
             'annotations': r'@\w+',
             'numbers': r'\b\d+\b',
             'operators': r'[+\-*/%=<>!&|^~]+'
+        },
+        Language.C: {
+            'keywords': r'\b(auto|break|case|char|const|continue|default|do|double|else|enum|extern|float|for|goto|if|int|long|register|return|short|signed|sizeof|static|struct|switch|typedef|union|unsigned|void|volatile|while)\b',
+            'strings': r'(\".*?\"|\'.*?\')',
+            'comments': r'//.*$|/\*[\s\S]*?\*/',
+            'preprocessor': r'#\s*(include|define|ifdef|ifndef|endif|pragma|error|warning)\b',
+            'numbers': r'\b\d+\b',
+            'operators': r'[+\-*/%=<>!&|^~?:]+'
+        },
+        Language.CPP: {
+            'keywords': r'\b(auto|break|case|catch|class|const|constexpr|continue|decltype|default|delete|do|double|else|enum|explicit|export|extern|false|final|float|for|friend|goto|if|inline|int|long|mutable|namespace|new|noexcept|nullptr|operator|private|protected|public|register|reinterpret_cast|return|short|signed|sizeof|static|static_assert|static_cast|struct|switch|template|this|throw|true|try|typedef|typeid|typename|union|unsigned|using|virtual|void|volatile|while)\b',
+            'strings': r'(\".*?\"|\'.*?\'|R"[^()]*\(.*?\)")',
+            'comments': r'//.*$|/\*[\s\S]*?\*/',
+            'preprocessor': r'#\s*(include|define|ifdef|ifndef|endif|pragma|error|warning)\b',
+            'numbers': r'\b\d+\b',
+            'operators': r'[+\-*/%=<>!&|^~?:]+|::|->|\.\*|->\*'
         }
     }
 
@@ -153,6 +222,11 @@ class SyntaxHighlighter:
             return Language.CSS
         if re.search(r'public\s+class|private\s+\w+|void\s+\w+\(', text):
             return Language.JAVA
+        if re.search(r'#include\s*[<"][^>"]+[>"]|\b(int|void|char|float|double)\s+\w+\s*\(', text):
+            if re.search(r'class\s+\w+|\bpublic:\b|\bprivate:\b|\bprotected:\b|std::|::', text):
+                return Language.CPP
+            else:
+                return Language.C
 
         return Language.PYTHON  # Default
 
@@ -170,22 +244,16 @@ class SyntaxHighlighter:
 
         # Apply language-specific highlighting
         if language == Language.PYTHON:
-            # Keywords
             for match in re.finditer(patterns['keywords'], line):
                 highlights.append((match.span(), SyntaxColors.PYTHON_KEYWORD))
-            # Strings
             for match in re.finditer(patterns['strings'], line):
                 highlights.append((match.span(), SyntaxColors.PYTHON_STRING))
-            # Comments
             for match in re.finditer(patterns['comments'], line):
                 highlights.append((match.span(), SyntaxColors.PYTHON_COMMENT))
-            # Numbers
             for match in re.finditer(patterns['numbers'], line):
                 highlights.append((match.span(), SyntaxColors.PYTHON_NUMBER))
-            # Functions
             for match in re.finditer(patterns['functions'], line):
                 highlights.append((match.span(), SyntaxColors.PYTHON_FUNCTION))
-            # Operators
             for match in re.finditer(patterns['operators'], line):
                 highlights.append((match.span(), SyntaxColors.PYTHON_OPERATOR))
 
@@ -224,6 +292,34 @@ class SyntaxHighlighter:
                 highlights.append((match.span(), SyntaxColors.JAVA_COMMENT))
             for match in re.finditer(patterns['annotations'], line):
                 highlights.append((match.span(), SyntaxColors.JAVA_ANNOTATION))
+
+        elif language == Language.C:
+            for match in re.finditer(patterns['keywords'], line):
+                highlights.append((match.span(), SyntaxColors.C_KEYWORD))
+            for match in re.finditer(patterns['strings'], line):
+                highlights.append((match.span(), SyntaxColors.C_STRING))
+            for match in re.finditer(patterns['comments'], line):
+                highlights.append((match.span(), SyntaxColors.C_COMMENT))
+            for match in re.finditer(patterns['preprocessor'], line):
+                highlights.append((match.span(), SyntaxColors.C_PREPROCESSOR))
+            for match in re.finditer(patterns['numbers'], line):
+                highlights.append((match.span(), SyntaxColors.C_NUMBER))
+            for match in re.finditer(patterns['operators'], line):
+                highlights.append((match.span(), SyntaxColors.C_OPERATOR))
+
+        elif language == Language.CPP:
+            for match in re.finditer(patterns['keywords'], line):
+                highlights.append((match.span(), SyntaxColors.C_KEYWORD))
+            for match in re.finditer(patterns['strings'], line):
+                highlights.append((match.span(), SyntaxColors.C_STRING))
+            for match in re.finditer(patterns['comments'], line):
+                highlights.append((match.span(), SyntaxColors.C_COMMENT))
+            for match in re.finditer(patterns['preprocessor'], line):
+                highlights.append((match.span(), SyntaxColors.C_PREPROCESSOR))
+            for match in re.finditer(patterns['numbers'], line):
+                highlights.append((match.span(), SyntaxColors.C_NUMBER))
+            for match in re.finditer(patterns['operators'], line):
+                highlights.append((match.span(), SyntaxColors.C_OPERATOR))
 
         # Sort by position and merge
         highlights.sort(key=lambda x: x[0][0])
@@ -293,7 +389,7 @@ class CodeCompleter:
 
 
 class SmoothCursor:
-    """Smooth, thin cursor with animation"""
+    """Smooth, ultra-thin cursor with soft outer glow using radial gradient"""
 
     def __init__(self, x, y, height):
         self.target_x = x
@@ -301,52 +397,97 @@ class SmoothCursor:
         self.current_x = x
         self.current_y = y
         self.height = height
-        self.width = 2  # Thin cursor
-        self.alpha = 255
+        self.width = 1  # 超细线
         self.blink_timer = 0
         self.visible = True
         self.speed = 0.3
 
+        # 预计算发光层（提高性能）
+        self.glow_layers = []
+        for i in range(1, 6):
+            alpha = int(30 * math.exp(-i / 1.5))
+            self.glow_layers.append((i, alpha))
+
     def update(self, target_x, target_y):
-        """Smooth cursor movement"""
         self.target_x = target_x
         self.target_y = target_y
-
-        # Smooth interpolation
         self.current_x += (self.target_x - self.current_x) * self.speed
         self.current_y += (self.target_y - self.current_y) * self.speed
-
-        # Blinking
         self.blink_timer += 1
         if self.blink_timer > 30:
             self.visible = not self.visible
             self.blink_timer = 0
 
     def draw(self, screen):
-        """Draw smooth thin cursor"""
         if not self.visible:
             return
 
-        # Main cursor (thin)
-        cursor_rect = pygame.Rect(
-            int(self.current_x),
-            int(self.current_y),
-            self.width,
-            self.height
-        )
+        x, y = int(self.current_x), int(self.current_y)
 
-        # Subtle glow
-        for i in range(3, 0, -1):
-            alpha = int(20 * math.exp(-i))
-            glow_rect = cursor_rect.inflate(i * 2, i)
-            pygame.draw.rect(screen, (*ACCENT_BLUE, alpha), glow_rect)
+        # 绘制外层发光（更柔和的扩散效果）
+        for i, alpha in self.glow_layers:
+            # 左右两侧的发光更明显，形成光晕效果
+            glow_width = self.width + i * 2
+            glow_height = self.height + i * 2
 
-        # Main cursor
-        pygame.draw.rect(screen, ACCENT_BLUE, cursor_rect)
+            # 左侧发光
+            left_glow = pygame.Rect(x - i, y - i, i * 2, glow_height)
+            left_surface = pygame.Surface((left_glow.width, left_glow.height), pygame.SRCALPHA)
+            pygame.draw.rect(left_surface, (*ACCENT_BLUE, alpha),
+                             (0, 0, left_glow.width, left_glow.height),
+                             border_radius=3)
+            screen.blit(left_surface, (left_glow.x, left_glow.y))
 
+            # 右侧发光
+            right_glow = pygame.Rect(x + self.width - i, y - i, i * 2, glow_height)
+            right_surface = pygame.Surface((right_glow.width, right_glow.height), pygame.SRCALPHA)
+            pygame.draw.rect(right_surface, (*ACCENT_BLUE, alpha),
+                             (0, 0, right_glow.width, right_glow.height),
+                             border_radius=3)
+            screen.blit(right_surface, (right_glow.x, right_glow.y))
+
+            # 顶部和底部轻微发光
+            if i <= 2:  # 只有内层才有顶部底部发光
+                top_glow = pygame.Rect(x - 1, y - i, self.width + 2, i)
+                top_surface = pygame.Surface((top_glow.width, top_glow.height), pygame.SRCALPHA)
+                pygame.draw.rect(top_surface, (*ACCENT_BLUE, alpha // 2),
+                                 (0, 0, top_glow.width, top_glow.height))
+                screen.blit(top_surface, (top_glow.x, top_glow.y))
+
+                bottom_glow = pygame.Rect(x - 1, y + self.height, self.width + 2, i)
+                bottom_surface = pygame.Surface((bottom_glow.width, bottom_glow.height), pygame.SRCALPHA)
+                pygame.draw.rect(bottom_surface, (*ACCENT_BLUE, alpha // 2),
+                                 (0, 0, bottom_glow.width, bottom_glow.height))
+                screen.blit(bottom_surface, (bottom_glow.x, bottom_glow.y))
+
+        # 绘制核心光标（最细的线）
+        cursor_rect = pygame.Rect(x, y, self.width, self.height)
+        pygame.draw.rect(screen, (255, 255, 255), cursor_rect)  # 纯白色光标
+
+class SmoothGlow:
+    """Smooth glow effect using Gaussian-like blur"""
+    @staticmethod
+    def create_glow_surface(text_surface, glow_color, intensity=1.0, spread=3):
+        padding = spread * 4
+        width = text_surface.get_width() + padding * 2
+        height = text_surface.get_height() + padding * 2
+        glow_surface = pygame.Surface((width, height), pygame.SRCALPHA)
+        for i in range(spread, 0, -1):
+            alpha = int(120 * intensity * math.exp(-i / 2))
+            scaled = pygame.transform.scale(
+                text_surface,
+                (int(text_surface.get_width() * (1 + i * 0.15)),
+                 int(text_surface.get_height() * (1 + i * 0.15)))
+            )
+            tinted = scaled.copy()
+            tinted.fill((*glow_color[:3], alpha), special_flags=pygame.BLEND_RGBA_MULT)
+            x = padding - (scaled.get_width() - text_surface.get_width()) // 2
+            y = padding - (scaled.get_height() - text_surface.get_height()) // 2
+            glow_surface.blit(tinted, (x, y))
+        return glow_surface
 
 class FileManager:
-    """Handle file operations"""
+    IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.webp']
 
     @staticmethod
     def open_file():
@@ -359,20 +500,26 @@ class FileManager:
                 ("HTML files", "*.html *.htm"),
                 ("CSS files", "*.css"),
                 ("Java files", "*.java"),
+                ("C files", "*.c"),
+                ("C++ files", "*.cpp *.cc *.cxx"),
+                ("Header files", "*.h *.hpp"),
                 ("Text files", "*.txt"),
+                ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp *.tiff *.webp"),
                 ("All files", "*.*")
             ]
         )
-
-        if file_path:
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                return file_path, content
-            except Exception as e:
-                print(f"Error opening file: {e}")
-                return None, None
-        return None, None
+        if not file_path:
+            return None, None
+        ext = Path(file_path).suffix.lower()
+        if ext in FileManager.IMAGE_EXTENSIONS:
+            return file_path, None
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            return file_path, content
+        except Exception as e:
+            print(f"Error opening file: {e}")
+            return None, None
 
     @staticmethod
     def save_file(content, current_file=None):
@@ -389,6 +536,9 @@ class FileManager:
                     ("HTML files", "*.html"),
                     ("CSS files", "*.css"),
                     ("Java files", "*.java"),
+                    ("C files", "*.c"),
+                    ("C++ files", "*.cpp"),
+                    ("Header files", "*.h"),
                     ("Text files", "*.txt"),
                     ("All files", "*.*")
                 ]
@@ -406,8 +556,425 @@ class FileManager:
 
     @staticmethod
     def save_as_file(content):
-        """Save as dialog"""
         return FileManager.save_file(content, None)
+
+
+class Terminal:
+    """跨平台终端模拟器"""
+
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+        self.lines = [""]
+        self.current_line = ""
+        self.cursor_pos = 0
+        self.history = []
+        self.history_index = -1
+        self.process = None
+        self.output_queue = queue.Queue()
+        self.running = False
+        self.font = FONT_MONO
+        self.line_height = 25
+        self.char_width = 10
+        self.prompt = "$ " if platform.system() != "Windows" else "> "
+        self.current_directory = os.getcwd()
+        self.copied_text = ""  # 用于内部剪贴板
+
+    def start(self):
+        """启动终端进程"""
+        self.running = True
+        self.lines = [f"Moqing Terminal [{platform.system()}]"]
+        self.lines.append(f"Working directory: {self.current_directory}")
+        self.lines.append("Type 'exit' to close terminal")
+        self.lines.append("")
+        self.current_line = self.prompt
+
+    def execute_command(self, command):
+        """执行命令"""
+        if not command.strip():
+            self.current_line = self.prompt
+            return
+
+        # 添加到历史记录
+        self.history.append(command)
+        self.history_index = len(self.history)
+
+        # 显示命令
+        self.lines.append(self.current_line)
+
+        # 处理内置命令
+        if command.strip() == "exit":
+            self.lines.append("Terminal closed")
+            self.running = False
+            return
+        elif command.strip() == "clear":
+            self.lines = [self.lines[0], self.lines[1], self.lines[2], ""]
+            self.current_line = self.prompt
+            return
+        elif command.strip().startswith("cd "):
+            self.handle_cd(command[3:].strip())
+            self.current_line = self.prompt
+            return
+
+        # 执行外部命令
+        try:
+            # 在不同平台上使用不同的shell
+            if platform.system() == "Windows":
+                process = subprocess.Popen(
+                    command,
+                    shell=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.PIPE,
+                    cwd=self.current_directory
+                )
+            else:
+                process = subprocess.Popen(
+                    command,
+                    shell=True,
+                    executable="/bin/bash",
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.PIPE,
+                    cwd=self.current_directory
+                )
+
+            stdout, stderr = process.communicate(timeout=5)
+
+            if stdout:
+                for line in stdout.decode('utf-8', errors='ignore').split('\n'):
+                    if line:
+                        self.lines.append(line)
+            if stderr:
+                for line in stderr.decode('utf-8', errors='ignore').split('\n'):
+                    if line:
+                        self.lines.append(f"Error: {line}")
+
+        except subprocess.TimeoutExpired:
+            process.kill()
+            self.lines.append("Command timed out")
+        except Exception as e:
+            self.lines.append(f"Error: {str(e)}")
+
+        self.current_line = self.prompt
+
+    def handle_cd(self, path):
+        """处理cd命令"""
+        try:
+            if not path:
+                path = str(Path.home())
+            new_path = Path(self.current_directory) / path
+            new_path = new_path.resolve()
+            if new_path.exists() and new_path.is_dir():
+                self.current_directory = str(new_path)
+                self.prompt = "$ " if platform.system() != "Windows" else "> "
+            else:
+                self.lines.append(f"Directory not found: {path}")
+        except Exception as e:
+            self.lines.append(f"Error: {str(e)}")
+
+    def copy_to_clipboard(self):
+        """复制当前行或最后输出到剪贴板"""
+        if self.lines:
+            # 如果有最后输出，复制最后输出；否则复制当前行
+            text = self.last_output if self.last_output else self.current_line
+            if CLIPBOARD_AVAILABLE:
+                try:
+                    pygame.scrap.put(pygame.SCRAP_TEXT, text.encode('utf-8'))
+                except:
+                    pass
+            self.copied_text = text
+            self.lines.append("[已复制]")
+
+    def paste_from_clipboard(self):
+        """从剪贴板粘贴到当前行"""
+        pasted = ""
+        if CLIPBOARD_AVAILABLE:
+            try:
+                pasted = pygame.scrap.get(pygame.SCRAP_TEXT).decode('utf-8')
+            except:
+                pass
+        if not pasted and self.copied_text:
+            pasted = self.copied_text
+        if pasted:
+            self.current_line += pasted.replace('\n', ' ').replace('\r', '')
+
+    def send_interrupt(self):
+        """向当前运行的子进程发送中断信号 (Ctrl+C)"""
+        if self.process and self.process.poll() is None:
+            if platform.system() == "Windows":
+                # Windows 下用 terminate 模拟
+                self.process.terminate()
+            else:
+                self.process.send_signal(signal.SIGINT)
+            self.lines.append("^C")
+        else:
+            self.lines.append("没有正在运行的进程")
+
+    def handle_key(self, event):
+        mods = pygame.key.get_mods()
+
+        # Ctrl+Shift+C 复制
+        if event.key == pygame.K_c and (mods & pygame.KMOD_CTRL) and (mods & pygame.KMOD_SHIFT):
+            self.copy_to_clipboard()
+            return
+
+        # Ctrl+Shift+V 粘贴
+        if event.key == pygame.K_v and (mods & pygame.KMOD_CTRL) and (mods & pygame.KMOD_SHIFT):
+            self.paste_from_clipboard()
+            return
+
+        # Ctrl+[ 发送中断
+        if event.key == pygame.K_LEFTBRACKET and (mods & pygame.KMOD_CTRL):
+            self.send_interrupt()
+            return
+        if event.key == pygame.K_RETURN:
+            command = self.current_line[len(self.prompt):]
+            self.execute_command(command)
+        elif event.key == pygame.K_BACKSPACE:
+            if len(self.current_line) > len(self.prompt):
+                self.current_line = self.current_line[:-1]
+        elif event.key == pygame.K_UP:
+            if self.history and self.history_index > 0:
+                self.history_index -= 1
+                self.current_line = self.prompt + self.history[self.history_index]
+        elif event.key == pygame.K_DOWN:
+            if self.history and self.history_index < len(self.history) - 1:
+                self.history_index += 1
+                self.current_line = self.prompt + self.history[self.history_index]
+            else:
+                self.current_line = self.prompt
+        elif event.key == pygame.K_TAB:
+            # 简单的tab补全
+            self.handle_tab_completion()
+        elif event.unicode and event.unicode.isprintable():
+            self.current_line += event.unicode
+
+    def handle_tab_completion(self):
+        """处理tab补全"""
+        current = self.current_line[len(self.prompt):]
+        if current.startswith("cd "):
+            # 补全目录
+            path_part = current[3:].strip()
+            try:
+                search_path = Path(self.current_directory) / path_part if path_part else Path(self.current_directory)
+                parent = search_path.parent if path_part and not search_path.exists() else search_path
+                pattern = search_path.name if path_part else ""
+
+                if parent.exists():
+                    matches = [p.name for p in parent.iterdir()
+                              if p.name.startswith(pattern) and p.is_dir()]
+                    if matches:
+                        if len(matches) == 1:
+                            self.current_line = self.prompt + "cd " + str(Path(path_part).parent / matches[0]) + "/"
+            except:
+                pass
+
+    def draw(self, screen):
+        """绘制终端"""
+        # 终端背景
+        pygame.draw.rect(screen, TERMINAL_BG, (0, 0, WINDOW_WIDTH, WINDOW_HEIGHT))
+
+        # 绘制行
+        y = 10
+        start_line = max(0, len(self.lines) - (WINDOW_HEIGHT // self.line_height) + 2)
+        for i in range(start_line, len(self.lines)):
+            line = self.lines[i]
+            text_surface = self.font.render(line, True, TERMINAL_TEXT)
+            screen.blit(text_surface, (10, y))
+            y += self.line_height
+
+        # 绘制当前行
+        current_surface = self.font.render(self.current_line, True, TERMINAL_TEXT)
+        screen.blit(current_surface, (10, y))
+
+        # 绘制光标
+        cursor_x = 10 + len(self.current_line) * self.char_width
+        if pygame.time.get_ticks() % 1000 < 500:
+            pygame.draw.line(screen, TERMINAL_TEXT,
+                           (cursor_x, y), (cursor_x, y + self.line_height - 5), 2)
+
+
+class ImagePreview:
+    """图片预览器"""
+
+    def __init__(self):
+        self.image = None
+        self.image_path = None
+        self.scale = 1.0
+        self.offset_x = 0
+        self.offset_y = 0
+        self.dragging = False
+        self.last_mouse = (0, 0)
+
+    def load_image(self, path):
+        """加载图片"""
+        try:
+            self.image_path = path
+            pil_image = Image.open(path)
+
+            # 转换PIL图片为pygame surface
+            mode = pil_image.mode
+            size = pil_image.size
+            data = pil_image.tobytes()
+
+            if mode == 'RGBA':
+                self.image = pygame.image.fromstring(data, size, 'RGBA').convert_alpha()
+            else:
+                self.image = pygame.image.fromstring(data, size, 'RGB').convert()
+
+            self.scale = 1.0
+            self.offset_x = 0
+            self.offset_y = 0
+            return True
+        except Exception as e:
+            print(f"Error loading image: {e}")
+            return False
+
+    def handle_event(self, event):
+        """处理鼠标事件"""
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button == 1:  # 左键拖拽
+                self.dragging = True
+                self.last_mouse = event.pos
+            elif event.button == 4:  # 滚轮向上 - 放大
+                self.scale *= 1.1
+            elif event.button == 5:  # 滚轮向下 - 缩小
+                self.scale /= 1.1
+
+        elif event.type == pygame.MOUSEBUTTONUP:
+            if event.button == 1:
+                self.dragging = False
+
+        elif event.type == pygame.MOUSEMOTION:
+            if self.dragging:
+                dx = event.pos[0] - self.last_mouse[0]
+                dy = event.pos[1] - self.last_mouse[1]
+                self.offset_x += dx
+                self.offset_y += dy
+                self.last_mouse = event.pos
+
+    def draw(self, screen):
+        """绘制图片"""
+        if not self.image:
+            # 显示提示
+            font = FONT_NORMAL
+            text = font.render("No image loaded", True, TEXT_SECONDARY)
+            text_rect = text.get_rect(center=(WINDOW_WIDTH//2, WINDOW_HEIGHT//2))
+            screen.blit(text, text_rect)
+            return
+
+        # 计算缩放后的尺寸
+        scaled_width = int(self.image.get_width() * self.scale)
+        scaled_height = int(self.image.get_height() * self.scale)
+
+        if scaled_width > 0 and scaled_height > 0:
+            scaled = pygame.transform.scale(self.image, (scaled_width, scaled_height))
+            screen.blit(scaled, (self.offset_x, self.offset_y))
+
+        # 显示图片信息
+        font = FONT_SMALL
+        info = f"Scale: {self.scale:.2f}x | File: {os.path.basename(self.image_path) if self.image_path else 'None'}"
+        text = font.render(info, True, TEXT_PRIMARY)
+        pygame.draw.rect(screen, BG_SECONDARY, (5, 5, text.get_width() + 10, text.get_height() + 10))
+        screen.blit(text, (10, 10))
+
+
+class EnhancedCodeCompleter(CodeCompleter):
+    """增强的代码联想引擎"""
+
+    # C/C++ 关键字
+    C_KEYWORDS = [
+        'auto', 'break', 'case', 'char', 'const', 'continue', 'default', 'do',
+        'double', 'else', 'enum', 'extern', 'float', 'for', 'goto', 'if',
+        'int', 'long', 'register', 'return', 'short', 'signed', 'sizeof', 'static',
+        'struct', 'switch', 'typedef', 'union', 'unsigned', 'void', 'volatile', 'while'
+    ]
+
+    CPP_KEYWORDS = [
+        'and', 'and_eq', 'asm', 'bitand', 'bitor', 'bool', 'catch', 'class',
+        'compl', 'const_cast', 'delete', 'dynamic_cast', 'explicit', 'export',
+        'false', 'friend', 'inline', 'mutable', 'namespace', 'new', 'not',
+        'not_eq', 'operator', 'or', 'or_eq', 'private', 'protected', 'public',
+        'reinterpret_cast', 'static_cast', 'template', 'this', 'throw', 'true',
+        'try', 'typeid', 'typename', 'using', 'virtual', 'wchar_t', 'xor', 'xor_eq'
+    ]
+
+    # C/C++ 标准库函数
+    C_STDLIB = {
+        'stdio.h': ['printf', 'scanf', 'fopen', 'fclose', 'fread', 'fwrite', 'fprintf', 'fscanf', 'getchar', 'putchar'],
+        'stdlib.h': ['malloc', 'calloc', 'realloc', 'free', 'atoi', 'atof', 'rand', 'srand', 'exit', 'qsort', 'bsearch'],
+        'string.h': ['strcpy', 'strncpy', 'strcat', 'strncat', 'strcmp', 'strncmp', 'strlen', 'strchr', 'strrchr', 'strstr'],
+        'math.h': ['sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'sqrt', 'pow', 'log', 'log10', 'exp', 'fabs', 'ceil', 'floor'],
+        'ctype.h': ['isalpha', 'isdigit', 'isalnum', 'islower', 'isupper', 'tolower', 'toupper', 'isspace'],
+        'time.h': ['time', 'clock', 'difftime', 'strftime', 'localtime', 'gmtime'],
+        'assert.h': ['assert']
+    }
+
+    CPP_STDLIB = {
+        'iostream': ['cin', 'cout', 'cerr', 'clog', 'endl', 'ws'],
+        'vector': ['push_back', 'pop_back', 'size', 'empty', 'clear', 'begin', 'end', 'insert', 'erase', 'resize'],
+        'string': ['length', 'size', 'substr', 'find', 'rfind', 'replace', 'append', 'c_str', 'compare'],
+        'map': ['insert', 'erase', 'find', 'count', 'begin', 'end', 'at', 'operator[]'],
+        'algorithm': ['sort', 'find', 'reverse', 'copy', 'max', 'min', 'swap', 'binary_search'],
+        'memory': ['shared_ptr', 'unique_ptr', 'make_shared', 'make_unique'],
+        'fstream': ['ifstream', 'ofstream', 'fstream', 'open', 'close', 'is_open'],
+        'sstream': ['stringstream', 'istringstream', 'ostringstream']
+    }
+
+    @classmethod
+    def get_completions(cls, text, language=Language.PYTHON, context=None):
+        """获取增强的代码联想建议"""
+        if not text:
+            return []
+
+        completions = []
+
+        # 处理模块导入
+        if '.' in text:
+            module, partial = text.rsplit('.', 1)
+            if language == Language.PYTHON and module in cls.COMMON_LIBS:
+                completions.extend([f"{module}.{func}" for func in cls.COMMON_LIBS[module]
+                                   if func.startswith(partial)])
+            elif language == Language.C and module in cls.C_STDLIB:
+                completions.extend([f"{module}.{func}" for func in cls.C_STDLIB[module]
+                                   if func.startswith(partial)])
+            elif language == Language.CPP and module in cls.CPP_STDLIB:
+                completions.extend([f"{module}.{func}" for func in cls.CPP_STDLIB[module]
+                                   if func.startswith(partial)])
+
+        # 语言特定的联想
+        if language == Language.PYTHON:
+            # Python 关键词
+            completions.extend([kw for kw in cls.PYTHON_KEYWORDS if kw.startswith(text)])
+            # Python 内置函数
+            completions.extend([b for b in cls.PYTHON_BUILTINS if b.startswith(text)])
+            # 常见库名
+            completions.extend([lib for lib in cls.COMMON_LIBS.keys() if lib.startswith(text)])
+
+        elif language == Language.C:
+            # C 关键词
+            completions.extend([kw for kw in cls.C_KEYWORDS if kw.startswith(text)])
+            # C 标准库函数
+            for lib, funcs in cls.C_STDLIB.items():
+                completions.extend([f"{lib}::{func}" for func in funcs if func.startswith(text)])
+
+        elif language == Language.CPP:
+            # C++ 关键词
+            completions.extend([kw for kw in cls.C_KEYWORDS + cls.CPP_KEYWORDS if kw.startswith(text)])
+            # C++ 标准库
+            for lib, funcs in cls.CPP_STDLIB.items():
+                completions.extend([f"{lib}::{func}" for func in funcs if func.startswith(text)])
+
+        # 上下文感知联想（简化版）
+        if context:
+            # 根据上下文提供更相关的建议
+            if 'include' in context and language in (Language.C, Language.CPP):
+                # 头文件联想
+                headers = list(cls.C_STDLIB.keys()) + list(cls.CPP_STDLIB.keys())
+                completions.extend([f"#include <{h}>" for h in headers if h.startswith(text)])
+
+        return sorted(set(completions))[:15]  # 返回前15个建议
 
 
 class CodeEditor:
@@ -417,12 +984,11 @@ class CodeEditor:
         self.cursor_y = 0
         self.current_language = Language.PYTHON
         self.working_directory = os.getcwd()
-        self.current_file = None  # Track current file path
+        self.current_file = None
 
         # Text rendering
-        self.font = pygame.font.Font(None, 24)
+        self.font = FONT_NORMAL
         self.font_height = 30
-        self.char_width = 12
         self.line_height = 35
         self.left_margin = 100
         self.top_margin = 60
@@ -433,11 +999,20 @@ class CodeEditor:
         self.selecting = False
         self.clipboard = ""
 
-        # Code completion
+        # Enhanced code completion
         self.completion_active = False
         self.completions = []
         self.selected_completion = 0
         self.completion_prefix = ""
+        self.completion_context = ""
+
+        # Terminal mode
+        self.terminal_mode = False
+        self.terminal = Terminal(WINDOW_WIDTH, WINDOW_HEIGHT)
+
+        # Image preview
+        self.image_preview_mode = False
+        self.image_preview = ImagePreview()
 
         # Input method (IME) support
         self.ime_text = ""
@@ -456,12 +1031,14 @@ class CodeEditor:
         self.key_repeat_interval = 30
         self.last_key_time = 0
 
-        # Search functionality
+        # Search functionality - 修复：添加新变量
         self.search_active = False
         self.search_query = ""
         self.search_results = []
         self.current_search_index = -1
         self.double_shift_time = 0
+        self.last_shift_key = None  # 记录最后一次按下的Shift键
+        self.search_input_active = False  # 搜索输入模式标志
 
         # Viewport
         self.viewport_x = 0
@@ -483,6 +1060,14 @@ class CodeEditor:
         # Notification system
         self.notification = None
         self.notification_timer = 0
+
+        self.insert_mode = True
+
+    def get_text_width(self, text):
+        """返回给定文本的渲染宽度（像素）"""
+        if not text:
+            return 0
+        return self.font.size(text)[0]
 
     def show_notification(self, message, duration=2000):
         """Show a temporary notification"""
@@ -516,75 +1101,105 @@ class CodeEditor:
 
     def handle_event(self, event):
         """Handle input events"""
+        # Terminal mode 处理
+        if self.terminal_mode:
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE and (pygame.key.get_mods() & pygame.KMOD_SHIFT):
+                    self.terminal_mode = False
+                    self.show_notification("Exited terminal mode")
+                else:
+                    self.terminal.handle_key(event)
+            return
+
+        # 图片预览模式处理
+        if self.image_preview_mode:
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                self.image_preview_mode = False
+                self.show_notification("Exited image preview")
+            else:
+                self.image_preview.handle_event(event)
+            return
+
+        # 正常编辑模式处理
         if event.type == pygame.KEYDOWN:
             self.handle_keydown(event)
             self.key_states[event.key] = pygame.time.get_ticks()
-
         elif event.type == pygame.KEYUP:
             if event.key in self.key_states:
                 del self.key_states[event.key]
-            # Clear completion on escape
             if event.key == pygame.K_ESCAPE:
                 self.completion_active = False
-
         elif event.type == pygame.MOUSEBUTTONDOWN:
             self.handle_mouse_click(event)
-
         elif event.type == pygame.MOUSEMOTION:
             if self.selecting:
                 self.handle_mouse_drag(event.pos)
-
         elif event.type == pygame.MOUSEBUTTONUP:
             self.selecting = False
-
         elif event.type == pygame.TEXTINPUT:
-            # Handle IME text input
-            if not self.search_active:
+            # 修复：搜索模式下，将文本输入添加到搜索框
+            if self.search_active:
+                self.search_query += event.text
+                self.update_search()
+            elif not self.completion_active:
                 self.insert_text(event.text)
                 self.update_completions()
-
         elif event.type == pygame.TEXTEDITING:
-            # Handle IME composition
             self.ime_text = event.text
             self.ime_active = True
 
     def handle_keydown(self, event):
         """Handle key press events"""
         current_time = pygame.time.get_ticks()
+        mods = pygame.key.get_mods()
 
-        # File operations (Ctrl+O, Ctrl+S)
-        if event.key == pygame.K_o and pygame.key.get_mods() & pygame.KMOD_CTRL:
+        # Ctrl+Alt+T 切换终端模式
+        if event.key == pygame.K_t and (mods & pygame.KMOD_CTRL) and (mods & pygame.KMOD_ALT):
+            self.terminal_mode = not self.terminal_mode
+            if self.terminal_mode:
+                self.terminal.start()
+                self.show_notification("Terminal mode activated (Ctrl+Esc to exit)")
+            return
+
+        # File operations
+        if event.key == pygame.K_o and mods & pygame.KMOD_CTRL:
             self.open_file()
-        elif event.key == pygame.K_s and pygame.key.get_mods() & pygame.KMOD_CTRL:
-            if pygame.key.get_mods() & pygame.KMOD_SHIFT:
-                self.save_file_as()  # Ctrl+Shift+S = Save As
+        elif event.key == pygame.K_s and mods & pygame.KMOD_CTRL:
+            if mods & pygame.KMOD_SHIFT:
+                self.save_file_as()
             else:
-                self.save_file()  # Ctrl+S = Save
+                self.save_file()
 
         # Copy/Paste shortcuts
-        elif event.key == pygame.K_c and pygame.key.get_mods() & pygame.KMOD_CTRL:
+        elif event.key == pygame.K_c and mods & pygame.KMOD_CTRL:
             self.copy_selection()
-        elif event.key == pygame.K_v and pygame.key.get_mods() & pygame.KMOD_CTRL:
+        elif event.key == pygame.K_v and mods & pygame.KMOD_CTRL:
             self.paste_clipboard()
-        elif event.key == pygame.K_x and pygame.key.get_mods() & pygame.KMOD_CTRL:
+        elif event.key == pygame.K_x and mods & pygame.KMOD_CTRL:
             self.cut_selection()
-        elif event.key == pygame.K_a and pygame.key.get_mods() & pygame.KMOD_CTRL:
+        elif event.key == pygame.K_a and mods & pygame.KMOD_CTRL:
             self.select_all()
 
-        # Format code (Ctrl+Alt+L)
-        elif event.key == pygame.K_l and (pygame.key.get_mods() & pygame.KMOD_CTRL) and (
-                pygame.key.get_mods() & pygame.KMOD_ALT):
+        # Format code
+        elif event.key == pygame.K_l and (mods & pygame.KMOD_CTRL) and (mods & pygame.KMOD_ALT):
             self.format_code()
 
-        # Toggle comment (Ctrl+/)
-        elif event.key == pygame.K_SLASH and pygame.key.get_mods() & pygame.KMOD_CTRL:
+        # Toggle comment
+        elif event.key == pygame.K_SLASH and mods & pygame.KMOD_CTRL:
             self.toggle_comment()
 
-        # Double shift detection
+        # Double shift search - 修复双击检测
         elif event.key in (pygame.K_LSHIFT, pygame.K_RSHIFT):
-            if current_time - self.double_shift_time < 300:
-                self.start_search()
-            self.double_shift_time = current_time
+            # 如果是第一次按下Shift或按下的Shift键与上次不同
+            if self.last_shift_key is None or self.last_shift_key != event.key:
+                self.last_shift_key = event.key
+                self.double_shift_time = current_time
+            else:
+                # 检查是否是双击（两次按同一个Shift键）
+                if current_time - self.double_shift_time < 300:
+                    self.start_search()
+                self.last_shift_key = None  # 重置，避免连续触发
+                self.double_shift_time = 0
 
         # Settings toggle
         elif event.key == pygame.K_F1:
@@ -604,25 +1219,48 @@ class CodeEditor:
                 self.selected_completion = min(len(self.completions) - 1, self.selected_completion + 1)
             elif event.key == pygame.K_RETURN or event.key == pygame.K_TAB:
                 self.apply_completion()
+            elif event.key == pygame.K_BACKSPACE:
+                self.handle_backspace()
+                self.update_completions()
             return
 
-        # Search handling
+        # Search handling - 修复搜索模式下的输入问题
         if self.search_active:
             if event.key == pygame.K_RETURN:
                 self.find_next()
             elif event.key == pygame.K_ESCAPE:
                 self.search_active = False
                 self.search_query = ""
+                self.search_results = []
+                self.search_input_active = False
+                # 重新启用文本输入
+                pygame.key.start_text_input()
             elif event.key == pygame.K_BACKSPACE:
-                self.search_query = self.search_query[:-1]
-                self.update_search()
-            return
+                if self.search_query:
+                    self.search_query = self.search_query[:-1]
+                    self.update_search()
+            elif event.key == pygame.K_TAB:
+                # 允许Tab键切换焦点或保留用于搜索
+                pass
+            elif event.key in (pygame.K_LSHIFT, pygame.K_RSHIFT):
+                # 允许Shift键（但不处理）
+                pass
+            else:
+                # 对于其他按键，让系统处理TEXTINPUT事件
+                # 这里不拦截，让TEXTINPUT事件处理
+                pass
+            return  # 重要：拦截所有按键，但TEXTINPUT会单独处理字符输入
 
-        # Regular editing
+        # 搜索模式下的文本输入由TEXTINPUT事件处理
+        # 所以这里不需要处理字符输入
+
+        # Regular editing (非搜索模式)
         if event.key == pygame.K_BACKSPACE:
             self.handle_backspace()
+            self.update_completions()
         elif event.key == pygame.K_RETURN:
             self.handle_enter()
+            self.update_completions()
         elif event.key == pygame.K_TAB:
             if self.completion_active:
                 self.apply_completion()
@@ -645,28 +1283,36 @@ class CodeEditor:
         self.detect_language()
 
     def handle_mouse_click(self, event):
-        """Handle mouse click including Ctrl+Middle button"""
-        if event.button == 2 and pygame.key.get_mods() & pygame.KMOD_CTRL:  # Ctrl+Middle click
-            # Set viewport center to clicked position
+        """Handle mouse click"""
+        if event.button == 2 and pygame.key.get_mods() & pygame.KMOD_CTRL:
+            # Ctrl+Middle click - center viewport
             world_x = event.pos[0] + self.viewport_x
             world_y = event.pos[1] + self.viewport_y
-
-            # Immediately set viewport to center on clicked position
             self.viewport_x = world_x - WINDOW_WIDTH // 2
             self.viewport_y = world_y - WINDOW_HEIGHT // 2
             self.show_notification("Viewport centered")
         else:
-            # Normal mouse click handling
+            # Normal click
             world_x = event.pos[0] + self.viewport_x
             world_y = event.pos[1] + self.viewport_y
 
             line_idx = int((world_y - self.top_margin) / self.line_height)
             if 0 <= line_idx < len(self.lines):
                 self.cursor_y = line_idx
-                col = int((world_x - self.left_margin) / self.char_width)
+                # 根据点击位置计算字符索引
+                line = self.lines[line_idx]
+                click_x = world_x - self.left_margin
+                total_width = 0
+                col = 0
+                for i, ch in enumerate(line):
+                    ch_width = self.font.size(ch)[0]
+                    if total_width + ch_width / 2 > click_x:  # 超过字符中间位置则选中该字符
+                        col = i
+                        break
+                    total_width += ch_width
+                    col = i + 1  # 如果循环结束，则位于行末
                 self.cursor_x = max(0, min(col, len(self.lines[line_idx])))
 
-                # Start selection
                 self.selecting = True
                 self.selection_start = (self.cursor_y, self.cursor_x)
                 self.selection_end = None
@@ -675,8 +1321,17 @@ class CodeEditor:
         """Open a file"""
         file_path, content = FileManager.open_file()
         if file_path and content is not None:
+            # 检查是否为图片文件
+            image_extensions = ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.webp']
+            if any(file_path.lower().endswith(ext) for ext in image_extensions):
+                if self.image_preview.load_image(file_path):
+                    self.image_preview_mode = True
+                    self.show_notification(f"Previewing image: {os.path.basename(file_path)}")
+                return
+
+            # 普通文本文件
             self.lines = content.splitlines()
-            if not self.lines:  # Ensure at least one line
+            if not self.lines:
                 self.lines = [""]
             self.current_file = file_path
             self.cursor_x = 0
@@ -842,17 +1497,28 @@ class CodeEditor:
 
     def update_completions(self):
         """Update code completion suggestions"""
-        # Get current word at cursor
+        # 获取当前行和上下文
         line = self.lines[self.cursor_y]
-        word_start = self.cursor_x
 
-        while word_start > 0 and (
-                line[word_start - 1].isalnum() or line[word_start - 1] == '_' or line[word_start - 1] == '.'):
+        # 获取当前单词的开始位置
+        word_start = self.cursor_x
+        while word_start > 0 and (line[word_start - 1].isalnum() or
+                                  line[word_start - 1] == '_' or
+                                  line[word_start - 1] == '.' or
+                                  line[word_start - 1] == ':'):
             word_start -= 1
+
+        # 获取上下文（前两行）
+        context_start = max(0, self.cursor_y - 2)
+        context = '\n'.join(self.lines[context_start:self.cursor_y + 1])
 
         if word_start < self.cursor_x:
             self.completion_prefix = line[word_start:self.cursor_x]
-            self.completions = CodeCompleter.get_completions(self.completion_prefix, self.current_language)
+            self.completions = EnhancedCodeCompleter.get_completions(
+                self.completion_prefix,
+                self.current_language,
+                context
+            )
             self.completion_active = len(self.completions) > 0
             self.selected_completion = 0
         else:
@@ -863,51 +1529,80 @@ class CodeEditor:
         if self.completions and 0 <= self.selected_completion < len(self.completions):
             completion = self.completions[self.selected_completion]
 
-            # Remove prefix and insert completion
+            # 移除前缀并插入补全
             line = self.lines[self.cursor_y]
             word_start = self.cursor_x
-            while word_start > 0 and (
-                    line[word_start - 1].isalnum() or line[word_start - 1] == '_' or line[word_start - 1] == '.'):
+            while word_start > 0 and (line[word_start - 1].isalnum() or
+                                      line[word_start - 1] == '_' or
+                                      line[word_start - 1] == '.'):
                 word_start -= 1
 
             self.lines[self.cursor_y] = line[:word_start] + completion + line[self.cursor_x:]
             self.cursor_x = word_start + len(completion)
             self.completion_active = False
+            self.show_notification(f"Completed: {completion}")
 
     def handle_key_holding(self):
-        """Handle smooth key holding"""
+        """Handle smooth key holding (including search backspace repeat)"""
         current_time = pygame.time.get_ticks()
-
         for key, press_time in list(self.key_states.items()):
             if current_time - press_time > self.key_repeat_delay:
-                if key == pygame.K_LEFT:
-                    self.move_cursor_left()
-                elif key == pygame.K_RIGHT:
-                    self.move_cursor_right()
-                elif key == pygame.K_UP:
-                    self.move_cursor_up()
-                elif key == pygame.K_DOWN:
-                    self.move_cursor_down()
-                elif key == pygame.K_BACKSPACE:
-                    self.handle_backspace()
-                elif key == pygame.K_RETURN:
-                    self.handle_enter()
-                elif key == pygame.K_PAGEUP:
-                    self.page_up()
-                elif key == pygame.K_PAGEDOWN:
-                    self.page_down()
+                if self.completion_active:
+                    # 联想导航重复
+                    if key == pygame.K_UP:
+                        self.selected_completion = max(0, self.selected_completion - 1)
+                    elif key == pygame.K_DOWN:
+                        self.selected_completion = min(len(self.completions) - 1, self.selected_completion + 1)
+                elif self.search_active:
+                    # 搜索模式下，退格键重复删除
+                    if key == pygame.K_BACKSPACE and self.search_query:
+                        self.search_query = self.search_query[:-1]
+                        self.update_search()
+                else:
+                    # 普通编辑模式重复
+                    if key == pygame.K_LEFT:
+                        self.move_cursor_left()
+                    elif key == pygame.K_RIGHT:
+                        self.move_cursor_right()
+                    elif key == pygame.K_UP:
+                        self.move_cursor_up()
+                    elif key == pygame.K_DOWN:
+                        self.move_cursor_down()
+                    elif key == pygame.K_BACKSPACE:
+                        self.handle_backspace()
+                    elif key == pygame.K_RETURN:
+                        self.handle_enter()
+                    elif key == pygame.K_PAGEUP:
+                        self.page_up()
+                    elif key == pygame.K_PAGEDOWN:
+                        self.page_down()
 
     def handle_mouse_drag(self, pos):
-        """Handle mouse drag for selection"""
-        if self.selecting:
-            world_x = pos[0] + self.viewport_x
-            world_y = pos[1] + self.viewport_y
+        """Handle mouse drag for selection (adapting to variable-width fonts)"""
+        if not self.selecting:
+            return
 
-            line_idx = int((world_y - self.top_margin) / self.line_height)
-            if 0 <= line_idx < len(self.lines):
-                col = int((world_x - self.left_margin) / self.char_width)
-                col = max(0, min(col, len(self.lines[line_idx])))
-                self.selection_end = (line_idx, col)
+        world_x = pos[0] + self.viewport_x
+        world_y = pos[1] + self.viewport_y
+
+        line_idx = int((world_y - self.top_margin) / self.line_height)
+        if 0 <= line_idx < len(self.lines):
+            line = self.lines[line_idx]
+            # 计算点击位置的字符索引
+            click_x = world_x - self.left_margin
+            total_width = 0
+            col = 0
+            for i, ch in enumerate(line):
+                ch_width = self.font.size(ch)[0]
+                # 如果点击位置在字符中间之后，定位到下一个字符
+                if total_width + ch_width / 2 > click_x:
+                    col = i
+                    break
+                total_width += ch_width
+                col = i + 1  # 如果循环结束，则位于行末
+            # 限制列范围
+            col = max(0, min(col, len(line)))
+            self.selection_end = (line_idx, col)
 
     def handle_backspace(self):
         if self.selection_start and self.selection_end:
@@ -945,13 +1640,18 @@ class CodeEditor:
         self.cursor_x = len(indent)
 
     def insert_text(self, text):
-        """Insert text at cursor position"""
+        """Insert text at cursor position (supports insert/overwrite modes)"""
         if self.selection_start and self.selection_end:
             self.delete_selection()
 
         line = self.lines[self.cursor_y]
-        self.lines[self.cursor_y] = line[:self.cursor_x] + text + line[self.cursor_x:]
-        self.cursor_x += len(text)
+        if self.insert_mode:
+            self.lines[self.cursor_y] = line[:self.cursor_x] + text + line[self.cursor_x:]
+            self.cursor_x += len(text)
+        else:
+            replace_len = min(len(text), len(line) - self.cursor_x)
+            self.lines[self.cursor_y] = line[:self.cursor_x] + text[:replace_len] + line[self.cursor_x + replace_len:]
+            self.cursor_x += len(text)
 
     def page_up(self):
         lines_per_page = WINDOW_HEIGHT // self.line_height
@@ -990,9 +1690,17 @@ class CodeEditor:
             self.cursor_x = min(self.cursor_x, len(self.lines[self.cursor_y]))
 
     def detect_language(self):
-        """Auto-detect language from content"""
+        """Enhanced language detection including C/C++"""
         full_text = "\n".join(self.lines)
-        self.current_language = SyntaxHighlighter.detect_language(full_text)
+
+        # C/C++ 检测
+        if re.search(r'#include\s*[<"][^>"]+[>"]|\b(int|void|char|float|double)\s+\w+\s*\(', full_text):
+            if re.search(r'class\s+\w+|\bpublic:\b|\bprivate:\b|\bprotected:\b|std::|::', full_text):
+                self.current_language = Language.CPP
+            else:
+                self.current_language = Language.C
+        else:
+            self.current_language = SyntaxHighlighter.detect_language(full_text)
 
     def start_search(self):
         self.search_active = True
@@ -1030,7 +1738,10 @@ class CodeEditor:
         self.viewport_y = target_y
 
     def update_viewport(self):
-        cursor_world_x = self.left_margin + self.cursor_x * self.char_width
+        """Smooth viewport following"""
+        # 获取光标前文本的实际宽度
+        prefix = self.lines[self.cursor_y][:self.cursor_x]
+        cursor_world_x = self.left_margin + self.get_text_width(prefix)
         cursor_world_y = self.top_margin + self.cursor_y * self.line_height
 
         target_x = cursor_world_x - WINDOW_WIDTH // 2
@@ -1040,10 +1751,11 @@ class CodeEditor:
         self.viewport_y += (target_y - self.viewport_y) * self.viewport_speed
 
     def world_to_screen(self, x, y):
+        """Convert world coordinates to screen coordinates"""
         return x - self.viewport_x, y - self.viewport_y
 
     def draw_selection(self, screen):
-        """Draw text selection"""
+        """Draw text selection (supports variable-width fonts)"""
         if not (self.selection_start and self.selection_end):
             return
 
@@ -1055,16 +1767,19 @@ class CodeEditor:
             start_y, end_y = end_y, start_y
             start_x, end_x = end_x, start_x
 
-        # Create selection surface
         selection_surface = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
 
         if start_y == end_y:
             # Single line selection
-            world_x1 = self.left_margin + start_x * self.char_width
+            line = self.lines[start_y]
+            # 计算起始和结束位置的世界坐标（基于前缀宽度）
+            prefix_start = line[:start_x]
+            prefix_end = line[:end_x]
+            world_x1 = self.left_margin + self.get_text_width(prefix_start)
+            world_x2 = self.left_margin + self.get_text_width(prefix_end)
             world_y = self.top_margin + start_y * self.line_height
-            screen_x1, screen_y = self.world_to_screen(world_x1, world_y)
 
-            world_x2 = self.left_margin + end_x * self.char_width
+            screen_x1, screen_y = self.world_to_screen(world_x1, world_y)
             screen_x2, _ = self.world_to_screen(world_x2, world_y)
 
             width = screen_x2 - screen_x1
@@ -1073,28 +1788,31 @@ class CodeEditor:
                                  (screen_x1, screen_y, width, self.line_height))
         else:
             # Multi-line selection
-            # First line
-            world_x1 = self.left_margin + start_x * self.char_width
+            # First line: from start_x to end of line
+            first_line = self.lines[start_y]
+            prefix_first = first_line[:start_x]
+            world_x1 = self.left_margin + self.get_text_width(prefix_first)
             world_y1 = self.top_margin + start_y * self.line_height
             screen_x1, screen_y1 = self.world_to_screen(world_x1, world_y1)
-            screen_x2 = WINDOW_WIDTH
-            width = screen_x2 - screen_x1
-            if width > 0:
+            # 第一行高亮到屏幕右边缘
+            width_first = WINDOW_WIDTH - screen_x1
+            if width_first > 0:
                 pygame.draw.rect(selection_surface, SELECTION_COLOR,
-                                 (screen_x1, screen_y1, width, self.line_height))
+                                 (screen_x1, screen_y1, width_first, self.line_height))
 
-            # Middle lines
+            # Middle lines: full lines
             for y in range(start_y + 1, end_y):
                 world_y = self.top_margin + y * self.line_height
                 screen_y = world_y - self.viewport_y
                 pygame.draw.rect(selection_surface, SELECTION_COLOR,
                                  (0, screen_y, WINDOW_WIDTH, self.line_height))
 
-            # Last line
+            # Last line: from 0 to end_x
+            last_line = self.lines[end_y]
+            prefix_last = last_line[:end_x]
+            world_x2 = self.left_margin + self.get_text_width(prefix_last)
             world_y2 = self.top_margin + end_y * self.line_height
-            screen_y2 = world_y2 - self.viewport_y
-            world_x2 = self.left_margin + end_x * self.char_width
-            screen_x2, _ = self.world_to_screen(world_x2, world_y2)
+            screen_x2, screen_y2 = self.world_to_screen(world_x2, world_y2)
             pygame.draw.rect(selection_surface, SELECTION_COLOR,
                              (0, screen_y2, screen_x2, self.line_height))
 
@@ -1106,7 +1824,8 @@ class CodeEditor:
             return
 
         # Calculate popup position
-        cursor_world_x = self.left_margin + self.cursor_x * self.char_width
+        prefix = self.lines[self.cursor_y][:self.cursor_x]
+        cursor_world_x = self.left_margin + self.get_text_width(prefix)
         cursor_world_y = self.top_margin + self.cursor_y * self.line_height
         screen_x, screen_y = self.world_to_screen(cursor_world_x, cursor_world_y + self.line_height)
 
@@ -1145,7 +1864,7 @@ class CodeEditor:
             # Draw completion type indicator
             if '.' in completion:
                 type_text = "member"
-            elif completion in CodeCompleter.PYTHON_KEYWORDS:
+            elif completion in EnhancedCodeCompleter.PYTHON_KEYWORDS:
                 type_text = "keyword"
             else:
                 type_text = "function"
@@ -1170,19 +1889,19 @@ class CodeEditor:
     def draw_text_with_highlight(self, screen, text, x, y, language):
         if not text:
             return
-
         highlights = SyntaxHighlighter.highlight_line(text, language)
-
         current_x = x
         for (start, end), color in highlights:
             if start >= len(text) or end > len(text):
                 continue
-
             segment = text[start:end]
             if not segment:
                 continue
-
             text_surface = self.font.render(segment, True, color)
+            # 为非默认颜色添加发光
+            if color != TEXT_PRIMARY:
+                glow = SmoothGlow.create_glow_surface(text_surface, color, 0.5, 2)
+                screen.blit(glow, (current_x - 2, y - 2))
             screen.blit(text_surface, (current_x, y))
             current_x += text_surface.get_width()
 
@@ -1191,11 +1910,15 @@ class CodeEditor:
             return
 
         for idx, (line_idx, start, end) in enumerate(self.search_results):
-            world_x = self.left_margin + start * self.char_width
+            # 计算从行首到起始位置的实际宽度
+            prefix = self.lines[line_idx][:start]
+            world_x = self.left_margin + self.get_text_width(prefix)
             world_y = self.top_margin + line_idx * self.line_height
             screen_x, screen_y = self.world_to_screen(world_x, world_y)
 
-            width = (end - start) * self.char_width
+            # 计算选中文本的实际宽度
+            text_segment = self.lines[line_idx][start:end]
+            width = self.get_text_width(text_segment)
 
             if idx == self.current_search_index:
                 color = (*ACCENT_ORANGE, 100)
@@ -1248,7 +1971,7 @@ class CodeEditor:
             value_surface = value_font.render(value, True, ACCENT_BLUE)
             screen.blit(value_surface, (panel_x + 250, y_pos))
 
-            # Working directory click handling (simplified)
+            # Working directory click handling
             if option == "Working Dir" and self.settings_alpha > 200:
                 if pygame.mouse.get_pressed()[0]:
                     mouse_x, mouse_y = pygame.mouse.get_pos()
@@ -1256,7 +1979,7 @@ class CodeEditor:
                         self.change_working_directory()
 
     def change_working_directory(self):
-        """Change working directory (simplified - just go up one level)"""
+        """Change working directory (go up one level)"""
         self.working_directory = str(Path(self.working_directory).parent)
         self.settings_options[3] = ("Working Dir", [self.working_directory])
         self.show_notification(f"Working dir: {os.path.basename(self.working_directory)}")
@@ -1319,10 +2042,28 @@ class CodeEditor:
                 self.notification = None
 
     def draw(self, screen):
+        """Main draw method"""
+        if self.terminal_mode:
+            self.terminal.draw(screen)
+            return
+
+        if self.image_preview_mode:
+            screen.fill(BG_PRIMARY)
+            self.image_preview.draw(screen)
+
+            # 绘制退出提示
+            font = pygame.font.Font(None, 20)
+            text = font.render("Press ESC to exit image preview", True, TEXT_SECONDARY)
+            screen.blit(text, (10, WINDOW_HEIGHT - 30))
+            return
+
+        # 正常编辑模式绘制
         screen.fill(BG_PRIMARY)
 
         # Update cursor position
-        cursor_world_x = self.left_margin + self.cursor_x * self.char_width
+        # 获取当前行光标前的文本宽度
+        prefix = self.lines[self.cursor_y][:self.cursor_x]
+        cursor_world_x = self.left_margin + self.get_text_width(prefix)
         cursor_world_y = self.top_margin + self.cursor_y * self.line_height + 2
         screen_cursor_x, screen_cursor_y = self.world_to_screen(cursor_world_x, cursor_world_y)
         self.cursor.update(screen_cursor_x, screen_cursor_y)
@@ -1330,13 +2071,18 @@ class CodeEditor:
         # Draw visible lines
         start_line = max(0, int(self.viewport_y / self.line_height))
         end_line = min(len(self.lines),
-                       int((self.viewport_y + WINDOW_HEIGHT) / self.line_height) + 2)
+                      int((self.viewport_y + WINDOW_HEIGHT) / self.line_height) + 2)
 
         for i in range(start_line, end_line):
             world_y = self.top_margin + i * self.line_height
             screen_y = world_y - self.viewport_y
 
             if -50 <= screen_y <= WINDOW_HEIGHT + 50:
+                if i == self.cursor_y:
+                    # 绘制半透明背景
+                    highlight_surf = pygame.Surface((WINDOW_WIDTH, self.line_height), pygame.SRCALPHA)
+                    highlight_surf.fill((*ACCENT_BLUE, 30))  # 浅蓝色透明
+                    screen.blit(highlight_surf, (0, screen_y))
                 self.draw_text_with_highlight(
                     screen,
                     self.lines[i],
@@ -1355,11 +2101,73 @@ class CodeEditor:
         self.draw_settings(screen)
         self.draw_notification(screen)
 
-        # Draw status bar
+        # Draw status bar with mode indicator
         file_name = os.path.basename(self.current_file) if self.current_file else "Untitled"
-        status_text = f"{file_name} | Language: {self.current_language.value} | Line: {self.cursor_y + 1}, Col: {self.cursor_x + 1} | Ctrl+O: Open, Ctrl+S: Save"
+        mode_text = "TERMINAL MODE (Ctrl+Alt+T)" if self.terminal_mode else "EDIT MODE"
+        status_text = f"{file_name} | Language: {self.current_language.value} | Mode: {mode_text} | Line: {self.cursor_y + 1}, Col: {self.cursor_x + 1}"
         status_surface = pygame.font.Font(None, 18).render(status_text, True, TEXT_SECONDARY)
         screen.blit(status_surface, (10, WINDOW_HEIGHT - 25))
+
+    def start_search(self):
+        """启动搜索模式"""
+        self.search_active = True
+        self.search_query = ""
+        self.search_results = []
+        self.current_search_index = -1
+        self.search_input_active = True
+        # 确保文本输入已启用
+        pygame.key.start_text_input()
+        self.show_notification("Search mode activated (type to search, Enter to find next, Esc to exit)")
+
+    def update_search(self):
+        """更新搜索结果"""
+        self.search_results = []
+        if not self.search_query:
+            return
+
+        search_lower = self.search_query.lower()
+        for i, line in enumerate(self.lines):
+            pos = 0
+            while True:
+                pos = line.lower().find(search_lower, pos)
+                if pos == -1:
+                    break
+                self.search_results.append((i, pos, pos + len(self.search_query)))
+                pos += 1
+
+        if self.search_results:
+            self.current_search_index = 0
+            # 自动跳转到第一个结果
+            self.go_to_search_result(0)
+        else:
+            self.current_search_index = -1
+
+    def go_to_search_result(self, index):
+        """跳转到指定的搜索结果"""
+        if not self.search_results or index < 0 or index >= len(self.search_results):
+            return
+
+        line_idx, start, end = self.search_results[index]
+        self.cursor_y = line_idx
+        self.cursor_x = start
+
+        # 选中搜索结果
+        self.selection_start = (line_idx, start)
+        self.selection_end = (line_idx, end)
+
+        # 滚动视图到光标位置
+        target_y = line_idx * self.line_height + self.top_margin - WINDOW_HEIGHT // 2
+        self.viewport_y = target_y
+
+    def find_next(self):
+        """查找下一个"""
+        if not self.search_results:
+            self.show_notification("No matches found")
+            return
+
+        self.current_search_index = (self.current_search_index + 1) % len(self.search_results)
+        self.go_to_search_result(self.current_search_index)
+        self.show_notification(f"Match {self.current_search_index + 1} of {len(self.search_results)}")
 
 
 def main():
@@ -1372,8 +2180,8 @@ def main():
             if event.type == pygame.QUIT:
                 running = False
             elif event.type in (pygame.KEYDOWN, pygame.KEYUP, pygame.MOUSEBUTTONDOWN,
-                                pygame.MOUSEMOTION, pygame.MOUSEBUTTONUP,
-                                pygame.TEXTINPUT, pygame.TEXTEDITING):
+                              pygame.MOUSEMOTION, pygame.MOUSEBUTTONUP,
+                              pygame.TEXTINPUT, pygame.TEXTEDITING):
                 editor.handle_event(event)
 
         editor.handle_key_holding()
